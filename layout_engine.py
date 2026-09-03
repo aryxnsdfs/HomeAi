@@ -16,6 +16,7 @@ import random
 import uuid
 import copy
 import hashlib
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from layout_templates import get_template_for_bhk
@@ -358,6 +359,30 @@ def compute_shared_walls(rooms: List[RoomNode]) -> List[Dict]:
     )
         
     return frontend_walls
+
+
+def _depths(limit: float, step: float = 0.5, floor: float = 1.0) -> List[float]:
+    """Growth depths to try, deepest first, down to a depth worth having."""
+    if limit < floor:
+        return []
+    depths, current = [], float(limit)
+    while current >= floor:
+        depths.append(round(current, 2))
+        current -= step
+    return depths
+
+
+def rects_overlap(first: "Rect", second: "Rect", tolerance: float = 0.05) -> bool:
+    """Do two rectangles share interior area?
+
+    Was a closure inside _recover_missing_requested_rooms. Anything that moves
+    or grows a solved rectangle needs it, and the two rules that did not use it
+    (otta, portico) could silently produce overlapping rooms.
+    """
+    return (
+        min(first.x + first.width, second.x + second.width) - max(first.x, second.x) > tolerance
+        and min(first.z + first.length, second.z + second.length) - max(first.z, second.z) > tolerance
+    )
 
 
 def _share_edge(a: Rect, b: Rect, tol: float = 0.35) -> bool:
@@ -1204,6 +1229,146 @@ class LayoutEngine:
             main.extend(group)
             logger.info("[GEOMETRY] Joined room component with rigid translation dx=%.2f dz=%.2f", dx, dz)
 
+    def _absorb_enclosed_pockets(self, nodes: List[RoomNode], min_pocket_sqft: float = 12.0,
+                                 passes: int = 3) -> None:
+        """Run the single-pass absorber until it stops making progress.
+
+        One pass can only take the deepest slice that fits, so an irregular
+        pocket needs a few rounds to be eaten completely.
+        """
+        for _ in range(max(1, passes)):
+            if not self._absorb_pockets_once(nodes, min_pocket_sqft):
+                break
+
+    def _absorb_pockets_once(self, nodes: List[RoomNode], min_pocket_sqft: float) -> bool:
+        """Grow a neighbour into any dead space the plan has walled in.
+
+        CP-SAT is free to leave gaps between rooms - non-overlap is a hard rule,
+        tiling is not - and `dead_space` is only a soft objective. Most gaps open
+        onto the outside and read as an ordinary L-shaped footprint, which is
+        fine. A pocket with rooms on every side is not: it is a void nobody can
+        reach, behind walls with nothing on the other side.
+
+        Rasterise the footprint at a foot, flood the empty cells in from the
+        border, and whatever the flood cannot reach is enclosed. Grow the
+        neighbour with the longest shared frontage over it, and only if the
+        result still overlaps nothing.
+        """
+        indoor = [
+            node for node in nodes
+            if not getattr(node, "is_outdoor", False) and node.roof_type != "open"
+        ]
+        if len(indoor) < 3:
+            return False
+        absorbed = False
+
+        min_x = min(n.rect.x for n in indoor)
+        min_z = min(n.rect.z for n in indoor)
+        max_x = max(n.rect.x + n.rect.width for n in indoor)
+        max_z = max(n.rect.z + n.rect.length for n in indoor)
+        cols = int(math.ceil(max_x - min_x))
+        rows = int(math.ceil(max_z - min_z))
+        if cols < 3 or rows < 3:
+            return False
+
+        # A cell counts as occupied when its centre falls inside a room, so two
+        # flush rooms never leave a phantom seam between them.
+        filled = [[False] * rows for _ in range(cols)]
+        for node in indoor:
+            r = node.rect
+            for cx in range(max(0, int(r.x - min_x)), min(cols, int(r.x + r.width - min_x) + 1)):
+                for cz in range(max(0, int(r.z - min_z)), min(rows, int(r.z + r.length - min_z) + 1)):
+                    px, pz = min_x + cx + 0.5, min_z + cz + 0.5
+                    if r.x <= px <= r.x + r.width and r.z <= pz <= r.z + r.length:
+                        filled[cx][cz] = True
+
+        seen = [[False] * rows for _ in range(cols)]
+        queue = deque()
+        for cx in range(cols):
+            for cz in (0, rows - 1):
+                if not filled[cx][cz] and not seen[cx][cz]:
+                    seen[cx][cz] = True
+                    queue.append((cx, cz))
+        for cz in range(rows):
+            for cx in (0, cols - 1):
+                if not filled[cx][cz] and not seen[cx][cz]:
+                    seen[cx][cz] = True
+                    queue.append((cx, cz))
+        while queue:
+            cx, cz = queue.popleft()
+            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, nz = cx + dx, cz + dz
+                if 0 <= nx < cols and 0 <= nz < rows and not filled[nx][nz] and not seen[nx][nz]:
+                    seen[nx][nz] = True
+                    queue.append((nx, nz))
+
+        # Collect each enclosed pocket as its own connected group.
+        pockets: List[List[Tuple[int, int]]] = []
+        claimed = [[False] * rows for _ in range(cols)]
+        for cx in range(cols):
+            for cz in range(rows):
+                if filled[cx][cz] or seen[cx][cz] or claimed[cx][cz]:
+                    continue
+                group, stack = [], [(cx, cz)]
+                claimed[cx][cz] = True
+                while stack:
+                    px, pz = stack.pop()
+                    group.append((px, pz))
+                    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, nz = px + dx, pz + dz
+                        if (0 <= nx < cols and 0 <= nz < rows and not filled[nx][nz]
+                                and not seen[nx][nz] and not claimed[nx][nz]):
+                            claimed[nx][nz] = True
+                            stack.append((nx, nz))
+                if len(group) >= min_pocket_sqft:
+                    pockets.append(group)
+
+        for group in pockets:
+            gx0 = min_x + min(c for c, _ in group)
+            gz0 = min_z + min(z for _, z in group)
+            gx1 = min_x + max(c for c, _ in group) + 1
+            gz1 = min_z + max(z for _, z in group) + 1
+            pocket = Rect(gx0, gz0, gx1 - gx0, gz1 - gz0)
+
+            # A pocket is rarely a neat rectangle. Growing a room over its whole
+            # bounding box therefore usually overlaps something and gets
+            # rejected, leaving the void in place, so take the deepest extension
+            # that actually fits and let the outer pass come back for the rest.
+            best, best_gain, best_rect = None, 0.0, None
+            for node in indoor:
+                r = node.rect
+                spans = []
+                if abs((r.x + r.width) - pocket.x) < 1.01:            # pocket to the east
+                    limit = (pocket.x + pocket.width) - (r.x + r.width)
+                    spans = [(d, Rect(r.x, r.z, r.width + d, r.length)) for d in _depths(limit)]
+                elif abs(r.x - (pocket.x + pocket.width)) < 1.01:     # pocket to the west
+                    limit = r.x - pocket.x
+                    spans = [(d, Rect(r.x - d, r.z, r.width + d, r.length)) for d in _depths(limit)]
+                elif abs((r.z + r.length) - pocket.z) < 1.01:         # pocket to the south
+                    limit = (pocket.z + pocket.length) - (r.z + r.length)
+                    spans = [(d, Rect(r.x, r.z, r.width, r.length + d)) for d in _depths(limit)]
+                elif abs(r.z - (pocket.z + pocket.length)) < 1.01:    # pocket to the north
+                    limit = r.z - pocket.z
+                    spans = [(d, Rect(r.x, r.z - d, r.width, r.length + d)) for d in _depths(limit)]
+
+                for depth, grown in spans:
+                    if any(rects_overlap(grown, other.rect) for other in nodes if other is not node):
+                        continue
+                    gain = depth * (r.width if grown.length != r.length else r.length)
+                    if gain > best_gain:
+                        best, best_gain, best_rect = node, gain, grown
+                    break  # _depths is deepest-first, so the first fit is the best
+
+            if best is not None and best_rect is not None:
+                logger.info(
+                    "  [VOID] Absorbing %.0f sq ft of enclosed dead space into '%s'.",
+                    best_gain, best.name,
+                )
+                best.rect = best_rect
+                absorbed = True
+
+        return absorbed
+
     def _close_nearby_wall_seams(self, nodes: List[RoomNode]) -> None:
         """Snap near-coincident room edges together so wall meshes cannot slit."""
         interior = [
@@ -1314,11 +1479,7 @@ class LayoutEngine:
         )
         obstacles = list(blocked_zones or [])
 
-        def rect_overlaps(first: Rect, second: Rect, tolerance: float = 0.05) -> bool:
-            return (
-                min(first.x + first.width, second.x + second.width) - max(first.x, second.x) > tolerance
-                and min(first.z + first.length, second.z + second.length) - max(first.z, second.z) > tolerance
-            )
+        rect_overlaps = rects_overlap
 
         def free_rect(candidate: Rect, bounds: Tuple[float, float, float, float]) -> bool:
             bx0, bz0, bx1, bz1 = bounds
@@ -2115,19 +2276,39 @@ class LayoutEngine:
         # ── Rule: Otta / Thinnai ─────────────────────────
         if indian_options.get("otta") and living and living.rect.length > 10.0:
             otta_l = 4.0
-            living.rect.length -= otta_l
-            living.rect.z += otta_l
-            otta_rect = Rect(living.rect.x, living.rect.z - otta_l, living.rect.width, otta_l)
-            nodes.append(RoomNode(id="otta-1", type="veranda", name="Otta", rect=otta_rect, wallThicknessIn=4.0, roof_type="flat", floorColor="#d6d3d1"))
+            shrunk = Rect(living.rect.x, living.rect.z + otta_l, living.rect.width, living.rect.length - otta_l)
+            otta_rect = Rect(living.rect.x, living.rect.z, living.rect.width, otta_l)
+            # The otta takes its depth out of the living room, so the veranda it
+            # leaves behind must not land on whatever sits in front.
+            blocked = any(
+                rects_overlap(otta_rect, other.rect) for other in nodes if other is not living
+            )
+            if blocked:
+                logger.info("  [OTTA] Skipping; the veranda would overlap a neighbouring room.")
+                otta_rect = None
+            else:
+                living.rect = shrunk
+            if otta_rect is not None:
+                nodes.append(RoomNode(id="otta-1", type="veranda", name="Otta", rect=otta_rect, wallThicknessIn=4.0, roof_type="flat", floorColor="#d6d3d1"))
 
         # ── Rule: Portico ────────────────────────────────────
         if indian_options.get("portico"):
             portico_rect = Rect(self.setback_x, self.setback_z, 10.0, 15.0)
+            # Pushing rooms aside to make room for the portico used to be done
+            # blind, so it could shove one room straight through another and
+            # undo the non-overlap CP-SAT had just guaranteed. Keep a push only
+            # when the result is still clear.
             for n in nodes:
                 if n.rect.x < portico_rect.x + 10.0 and n.rect.z < portico_rect.z + 15.0:
                     push_x = (portico_rect.x + 10.0) - n.rect.x
-                    n.rect.x += push_x
-                    n.rect.width = max(n.rect.width - push_x, 4.0)
+                    moved = Rect(n.rect.x + push_x, n.rect.z, max(n.rect.width - push_x, 4.0), n.rect.length)
+                    if any(rects_overlap(moved, other.rect) for other in nodes if other is not n):
+                        logger.info(
+                            "  [PORTICO] Leaving '%s' where it is; the push would overlap a neighbour.",
+                            n.name,
+                        )
+                        continue
+                    n.rect = moved
             nodes.append(RoomNode(id="portico-1", type="parking", name="Portico", rect=portico_rect, wallThicknessIn=0.0, roof_type="flat", floorColor="#9ca3af"))
 
         # ── Rule: Double-Height Ceiling ──────────────────────────────────
@@ -2146,6 +2327,7 @@ class LayoutEngine:
                 additional_nodes=[node for node in nodes if node not in interior_nodes],
             )
         self._repair_disconnected_components(nodes)
+        self._absorb_enclosed_pockets(nodes)
         self._close_nearby_wall_seams(nodes)
 
         inject_main_entrance(nodes, self.buildable_width, self.buildable_length,

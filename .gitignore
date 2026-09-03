@@ -1,24 +1,25 @@
 __pycache__/
+
 *.pyc
 
 node_modules/
+
 dist/
+
+model_artifacts/
+
+*.gguf
+
+*.pt
+
+*.safetensors
 
 venv/
 .venv/
 venv_linux/
 .env
 
-model_artifacts/
-*.gguf
-*.pt
-*.safetensors
+public/blueprints/
 
-# Offline training data, not needed to run the app
-indian_nlp_training.csv
-indian_physics_training.csv
-
-# Generated at runtime
-public/blueprints/*
-!public/blueprints/.gitkeep
-generated_nodes.json
+# Local dev preview config
+.claude/
