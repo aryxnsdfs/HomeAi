@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+
+node_modules/
+dist/
+
+venv/
+.venv/
+venv_linux/
+.env
+
+model_artifacts/
+*.gguf
+*.pt
+*.safetensors
+
+# Offline training data, not needed to run the app
+indian_nlp_training.csv
+indian_physics_training.csv
+
+# Generated at runtime
+public/blueprints/*
+!public/blueprints/.gitkeep
+generated_nodes.json
